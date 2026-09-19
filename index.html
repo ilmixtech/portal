@@ -116,6 +116,9 @@ html.portal-update-open,html.portal-update-open body{overflow:hidden}
 @keyframes update-card-in{from{opacity:0;transform:translateY(12px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}
 @media(max-width:600px){.portal-update-backdrop{padding:12px}.portal-update-dialog{width:min(560px,calc(100vw - 24px),calc((100dvh - 24px)*.926));border-radius:22px}.update-hit:focus-visible{outline-width:2px;outline-offset:2px;box-shadow:0 0 0 5px #7642c4}}
 @media(prefers-reduced-motion:reduce){.portal-update-backdrop,.portal-update-dialog{animation:none}.update-hit{transition:none}}
+
+/* Away uses the existing status layout; the rest of the theme stays unchanged. */
+.presence-label.away{color:#b07b30}.presence-label.away>i{background:#dda44d;box-shadow:0 0 0 2px #dda44d15}.online-dot.presence-dot.away{background:#dda44d}html[data-theme=dark] .presence-label.away{color:#e6bc77}
 </style></head>
 <body><div id="app"><div class="loading"><img id="boot-logo" class="ilmix-mark" alt="ILMIX logo" width="40" height="40"><h2>Opening your workspace</h2><p>Getting everything ready…</p></div></div><div id="toast-area" aria-live="polite"></div><div id="modal-root"></div><div id="drawer-root"></div><noscript>Enable JavaScript to open your ILMIX workspace.</noscript><script>(() => {
 'use strict';
@@ -181,13 +184,56 @@ const initials=n=>String(n).split(' ').slice(0,2).map(p=>p[0]).join('').toUpperC
 // Existing backend lastSeen timestamps refresh at most once per minute.
 // A 90-second window tolerates that heartbeat cadence; device time uses the server clock.
 let presenceClockOffset=0;
+// A tab publishes its visibility separately from the legacy activity timestamp.
+let presenceTabId='',presenceSequence=0,lastPresenceSend=0,presenceSession='',lastBackgroundRefresh=0;
+function publishPresence(force=false,status=document.visibilityState==='hidden'?'away':'online'){
+ if(!me()||!sessionToken)return Promise.resolve();
+ if(presenceSession!==sessionToken){presenceTabId=newId();presenceSequence=0;lastPresenceSend=0;presenceSession=sessionToken;}
+ if(!force&&Date.now()-lastPresenceSend<25000)return Promise.resolve();
+ lastPresenceSend=Date.now();
+ const headers={'Content-Type':'application/json',apikey:connection.key};if(connection.key.startsWith('eyJ'))headers.Authorization='Bearer '+connection.key;
+ return fetch(connection.url+'/rest/v1/rpc/ilmix_presence',{method:'POST',headers,keepalive:true,body:JSON.stringify({p_token:sessionToken,p_tab_id:presenceTabId,p_status:status,p_sequence:++presenceSequence})}).catch(()=>{});
+}
+
+// One gentle chime for a batch of new incoming updates, never old unread items.
+let alertAudio=null,alertSession='',alertNotificationId=0,alertMessageId=0;
+function unlockAlertAudio(e){
+ if(!e.isTrusted)return;
+ try{const Audio=window.AudioContext||window.webkitAudioContext;if(!Audio)return;if(!alertAudio||alertAudio.state==='closed')alertAudio=new Audio();if(alertAudio.state==='suspended')void alertAudio.resume().catch(()=>{});}catch{}
+}
+document.addEventListener('pointerdown',unlockAlertAudio,{capture:true,passive:true});
+document.addEventListener('keydown',unlockAlertAudio,{capture:true});
+function playIncomingChime(notificationId,messageId){
+ if(!alertAudio||alertAudio.state!=='running'||!me())return;
+ const key='ilmix:alert:'+me().id;
+ try{const previous=JSON.parse(localStorage.getItem(key)||'{}');if((previous.notificationId||0)>=notificationId&&(previous.messageId||0)>=messageId)return;localStorage.setItem(key,JSON.stringify({notificationId:Math.max(notificationId,previous.notificationId||0),messageId:Math.max(messageId,previous.messageId||0)}));}catch{}
+ try{const now=alertAudio.currentTime;[659.25,880].forEach((frequency,i)=>{const osc=alertAudio.createOscillator(),gain=alertAudio.createGain(),start=now+i*.11;osc.type='sine';osc.frequency.value=frequency;gain.gain.setValueAtTime(0,start);gain.gain.linearRampToValueAtTime(.075,start+.015);gain.gain.exponentialRampToValueAtTime(.0001,start+.23);osc.connect(gain);gain.connect(alertAudio.destination);osc.onended=()=>{osc.disconnect();gain.disconnect();};osc.start(start);osc.stop(start+.25);});}catch{}
+}
+function detectIncomingAlerts(){
+ if(!me())return;
+ const nMax=Math.max(0,...data.notifications.map(n=>Number(n.id))),mMax=Math.max(0,...data.conversations.map(c=>Number(c.last?.id||0)));
+ if(alertSession!==sessionToken){alertSession=sessionToken;alertNotificationId=nMax;alertMessageId=mMax;return;}
+ const incomingNotification=data.notifications.some(n=>Number(n.id)>alertNotificationId&&!n.read_at);
+ const incomingMessage=data.conversations.some(c=>c.last&&Number(c.last.id)>alertMessageId&&c.last.sender_id!==me().id);
+ alertNotificationId=Math.max(alertNotificationId,nMax);alertMessageId=Math.max(alertMessageId,mMax);
+ if(incomingNotification||incomingMessage)playIncomingChime(nMax,mMax);
+}
+
+function canRateWork(w){return !!w&&w.status==='Completed'&&has('review_work')&&(w.assignee!==me().id||isCEO());}
+function openRating(w,justApproved=false){
+ if(!canRateWork(w))return;
+ openModal('rating',justApproved?'Approved. Add your rating.':'Rate this completed '+(w.kind==='slot'?'ad':'task'), 'Choose 1–5 stars and add feedback for the production team.',`<form data-form="rating" data-id="${w.id}" data-version="${w.version}"><label class="field">Quality rating<select name="rating" required><option value="" ${!w.rating?'selected':''} disabled>Choose a rating</option>${[5,4,3,2,1].map(n=>`<option value="${n}" ${w.rating===n?'selected':''}>${'★'.repeat(n)} · ${n} / 5</option>`).join('')}</select></label><label class="field" style="margin-top:18px">Feedback <span class="muted small">(optional)</span><textarea name="feedback" rows="4" maxlength="2000">${escape(w.feedback)}</textarea></label><div class="form-error" role="alert"></div><div class="form-actions">${btn('Not now','close-modal','','type="button"')}${btn('Save rating','submit','primary','type="submit"')}</div></form>`);
+}
+
 function presenceInfo(id){
- const u=user(id);
+ const u=user(id),self=id===me()?.id;
  if(!u.active)return {state:'offline',label:'Offline',detail:'This account is inactive.'};
- if(id===me()?.id&&backendPhase==='offline')return {state:'offline',label:'Offline',detail:'Your connection to the workspace is offline.'};
- if(backendPhase!=='connected'||!lastGoodSync||Date.now()-lastGoodSync>30000)return {state:'unknown',label:'Status unavailable',detail:'Reconnect to update online status.'};
+ if(self&&backendPhase==='offline')return {state:'offline',label:'Offline',detail:'Your connection to the workspace is offline.'};
+ if(backendPhase!=='connected'||!lastGoodSync||Date.now()-lastGoodSync>(document.visibilityState==='hidden'?180000:30000))return {state:'unknown',label:'Status unavailable',detail:'Reconnect to update online status.'};
  const now=Date.now()+presenceClockOffset,seen=Date.parse(u.lastSeen),age=now-seen;
- if(id===me()?.id||Number.isFinite(seen)&&age>=-10000&&age<90000)return {state:'online',label:'Online',detail:'Active in the portal within the last 90 seconds.'};
+ const state=self?(document.visibilityState==='hidden'?'away':'online'):u.presence||(Number.isFinite(seen)&&age>=-10000&&age<90000?'online':'offline');
+ if(state==='online')return {state:'online',label:'Online',detail:'Active in the portal.'};
+ if(state==='away')return {state:'away',label:'Away',detail:'Signed in with the portal tab in the background.'};
  const minutes=Number.isFinite(seen)?Math.max(1,Math.floor(age/60000)):0;
  const last=minutes?minutes<60?`${minutes} min ago`:minutes<1440?`${Math.floor(minutes/60)} hr ago`:dateTime(u.lastSeen):'';
  return {state:'offline',label:'Offline',detail:last?'Last seen '+last:'No recent activity.'};
@@ -308,13 +354,16 @@ async function refresh(force=false){
     const previous=data?.me?.id;data=await api('/api/state');
     if(!data.me){stopLive();closeModal(true);renderLogin();return;}
     if(previous!==data.me.id){page='dashboard';scope=isCEO()?'all':data.me.id;dashboardLane='focus';reportUser=data.me.id;days=30;taskSearch='';activeConversation='';drafts={};threadMessages=[];}
+    detectIncomingAlerts();void publishPresence();
     if(!source)startLive();
+    if(document.visibilityState==='hidden'&&previous===me().id&&!force){syncPresenceUI();return;}
     const renderThis=++renderEpoch;
     if(page==='dashboard')dashboard=await api(`/api/dashboard?user=${encodeURIComponent(scope||me().id)}&days=${days}`);
     if(page==='reports')report=await api(`/api/report?user=${encodeURIComponent(reportUser||me().id)}&days=${days}`);
     if(renderThis!==renderEpoch)return;
     const focus=document.activeElement;
-    if(page==='messages'&&previous===me().id&&!force){if($('#conversation-list'))$('#conversation-list').innerHTML=conversationsHTML();updateCounts();}
+    if(selectedWork&&$('.drawer',drawerRoot)&&previous===me().id&&!force){updateCounts();}
+    else if(page==='messages'&&previous===me().id&&!force){syncPanelHTML($('#conversation-list'),conversationsHTML());updateCounts();}
     else if(force||previous!==me().id||!focus||!['INPUT','TEXTAREA','SELECT'].includes(focus.tagName))render();
     else updateCounts();
     if(selectedWork&&!modalType)renderDrawer();
@@ -324,12 +373,12 @@ async function refresh(force=false){
 }
 function startLive(){
  source={close(){}};live=true;clearInterval(poll);
- poll=setInterval(()=>{if(document.visibilityState==='visible'&&me())refresh();},2500);
+ poll=setInterval(()=>{if(!me())return;if(document.visibilityState==='visible')refresh();else if(Date.now()-lastBackgroundRefresh>=15000){lastBackgroundRefresh=Date.now();refresh();}},2500);
 }
 function stopLive(){source=null;clearInterval(poll);live=false;}
 function updateLive(){document.querySelectorAll('.live').forEach(n=>{n.classList.toggle('offline',backendPhase==='offline');n.textContent=backendPhase==='connected'?'Connected':backendPhase==='checking'?'Connecting…':'Offline';});syncConnectionUI();syncPresenceUI();}
 function updateCounts(){
-  syncPresenceUI();syncChatDock();const unread=data.conversations.reduce((s,c)=>s+c.unread,0);const b=$('#message-count');if(b){b.textContent=unread;b.hidden=!unread;}
+  syncPresenceUI();syncChatDock();const unread=data.conversations.reduce((s,c)=>s+c.unread,0);const b=$('#message-count');if(b){if(b.textContent!==String(unread))b.textContent=unread;b.hidden=!unread;}
   const dot=$('#notification-dot');if(dot)dot.hidden=!data.notifications.some(n=>!n.read_at);
 }
 async function action(payload,success){
@@ -339,13 +388,52 @@ async function action(payload,success){
 function nav(p){chatDockOpen=false;page=p;taskSearch='';taskStatus='all';taskAssignee='all';clientFilter='';mobile=false;selectedWork='';drawerRoot.innerHTML='';renderEpoch++;if(['dashboard','reports'].includes(p))refresh(true);else render();if(p==='messages'&&activeConversation)loadMessages();}
 const titleMap={dashboard:'Dashboard',my:'My Tasks',all:'All Work',slots:'Booked Slots',review:'Review Queue',completed:'Completed',clients:'Clients',team:'My Teams',reports:'Reports',messages:'Messages',settings:'Settings'};
 function navAllowed(){return [['dashboard','Dashboard','dashboard'],['my','My Tasks','tasks'],...(has('view_all')?[['all','All Work','board']]:[]),...(has('book_slot')?[['slots','Booked Slots','slots']]:[]),...(has('review_work')?[['review','Review Queue','review']]:[]),['completed','Completed','completed'],['messages','Messages','message'],...(has('view_clients')?[['clients','Clients','clients']]:[]),...((isCEO()||me().role==='Partner'||has('view_reports'))?[['team','My Teams','team']]:[]),['reports',has('view_reports')?'Reports':'My Report','reports'],['settings','Settings','settings']];}
+// Reconcile live panels in place. Polling must not recreate the navigation,
+// reopen panel animations, or discard a user's focus and scroll position.
+function panelNodeKey(node){
+  if(node.nodeType!==1)return '';
+  for(const attr of ['id','data-page','data-nav','data-work','data-presence-user','data-group-presence']){
+    if(node.hasAttribute(attr))return attr+':'+node.getAttribute(attr);
+  }
+  if(node.hasAttribute('data-action'))return 'action:'+node.dataset.action+':'+(node.dataset.id||'')+':'+(node.dataset.status||'');
+  return node.getAttribute('class')?.trim().split(/\s+/)[0]||'';
+}
+function samePanelNode(a,b){
+  return !!a&&a.nodeType===b.nodeType&&(a.nodeType!==1||(a.localName===b.localName&&a.namespaceURI===b.namespaceURI&&panelNodeKey(a)===panelNodeKey(b)));
+}
+function syncPanelNode(current,next){
+  if(current.isEqualNode(next))return;
+  if(current.nodeType!==1){if(current.nodeValue!==next.nodeValue)current.nodeValue=next.nodeValue;return;}
+  for(const attr of [...current.attributes])if(!next.hasAttribute(attr.name))current.removeAttribute(attr.name);
+  for(const attr of next.attributes)if(current.getAttribute(attr.name)!==attr.value)current.setAttribute(attr.name,attr.value);
+  syncPanelChildren(current,next);
+}
+function syncPanelChildren(current,next){
+  let cursor=current.firstChild;
+  for(const incoming of [...next.childNodes]){
+    let match=cursor;
+    while(match&&!samePanelNode(match,incoming))match=match.nextSibling;
+    if(!match){match=incoming.cloneNode(true);current.insertBefore(match,cursor);}
+    else{if(match!==cursor)current.insertBefore(match,cursor);syncPanelNode(match,incoming);}
+    cursor=match.nextSibling;
+  }
+  while(cursor){const stale=cursor;cursor=cursor.nextSibling;stale.remove();}
+}
+function syncPanelHTML(target,html){
+  if(!target)return;
+  const template=document.createElement('template');template.innerHTML=html;
+  const focused=document.activeElement;
+  syncPanelChildren(target,template.content);
+  if(focused!==document.activeElement&&focused?.isConnected&&focused!==document.body)focused.focus({preventScroll:true});
+}
 function render(){
   if(!data?.me){renderLogin();return;}
   if(!navAllowed().some(([id])=>id===page))page='dashboard';
   const unread=data.conversations.reduce((s,c)=>s+c.unread,0),mine=data.work.filter(w=>w.assignee===me().id&&w.status!=='Completed').length;
-  app.innerHTML=`${mobile?'<div class="mobile-shade" data-action="mobile-close"></div>':''}<aside class="sidebar ${mobile?'mobile-open':''}">${brandIdentity()}<div class="workspace-label">WORKSPACE</div><nav class="nav-group" aria-label="Main navigation">${navAllowed().filter(x=>x[0]!=='settings').map(([id,label,ico])=>`<button class="nav-item ${page===id?'active':''}" data-nav="${id}" ${page===id?'aria-current="page"':''}>${icon(ico)}<span>${label}</span>${id==='my'&&mine?`<span class="nav-count soft">${mine}</span>`:id==='messages'?`<span class="nav-count" id="message-count" ${unread?'':'hidden'}>${unread}</span>`:''}</button>`).join('')}</nav><div class="sidebar-bottom"><button class="nav-item ${page==='settings'?'active':''}" data-nav="settings">${icon('settings')}Settings</button><div class="sidebar-user">${avatar(me().id,'',true)}<div><strong>${escape(me().name)}</strong><small class="sidebar-role">${me().role}</small><span class="sidebar-presence">${memberPresence(me().id)}</span></div>${icobtn('logout','Sign out','logout')}</div></div></aside>
+  const markup=`${mobile?'<div class="mobile-shade" data-action="mobile-close"></div>':''}<aside class="sidebar ${mobile?'mobile-open':''}">${brandIdentity()}<div class="workspace-label">WORKSPACE</div><nav class="nav-group" aria-label="Main navigation">${navAllowed().filter(x=>x[0]!=='settings').map(([id,label,ico])=>`<button class="nav-item ${page===id?'active':''}" data-nav="${id}" ${page===id?'aria-current="page"':''}>${icon(ico)}<span>${label}</span>${id==='my'&&mine?`<span class="nav-count soft">${mine}</span>`:id==='messages'?`<span class="nav-count" id="message-count" ${unread?'':'hidden'}>${unread}</span>`:''}</button>`).join('')}</nav><div class="sidebar-bottom"><button class="nav-item ${page==='settings'?'active':''}" data-nav="settings">${icon('settings')}Settings</button><div class="sidebar-user">${avatar(me().id,'',true)}<div><strong>${escape(me().name)}</strong><small class="sidebar-role">${me().role}</small><span class="sidebar-presence">${memberPresence(me().id)}</span></div>${icobtn('logout','Sign out','logout')}</div></div></aside>
   <div class="main-shell ${page==='messages'?'messaging-shell':''}"><header class="topbar"><div class="breadcrumb">${icobtn('menu','Open navigation','mobile-toggle','class="mobile-menu"')}<span>Workspace</span><span>/</span><strong>${titleMap[page]}</strong></div><div class="top-actions"><label class="global-search">${icon('search')}<input id="global-search" aria-label="Search work" placeholder="Search your workspace…"><kbd>↵</kbd></label><span class="live topbar-live"></span>${icobtn('moon','Toggle light or dark theme','theme')}<button class="icon-btn" aria-label="Notifications" data-action="notifications">${icon('bell')}<span id="notification-dot" class="unread-dot" ${data.notifications.some(n=>!n.read_at)?'':'hidden'}></span></button><span class="top-divider"></span><button class="icon-btn" data-nav="settings" aria-label="My account">${avatar(me().id)}</button></div></header>
-  <div id="backend-notice" aria-live="polite"></div><main class="content ${page==='messages'?'messages-page':page==='dashboard'?'dashboard-page':''}">${data.demo?'<div class="demo-banner">Demo workspace · Sample projects and conversations. Your real business records are not connected.</div>':''}${renderPage()}<footer class="bottom-note"><span>ILMIX © ${new Date().getFullYear()} · Production workspace</span><span>Production workspace v${escape(data.release)} · All times in PKT</span></footer></main></div>${renderChatDock()}`;
+  <div id="backend-notice" aria-live="polite"></div><main data-page="${page}" class="content ${page==='messages'?'messages-page':page==='dashboard'?'dashboard-page':''}">${data.demo?'<div class="demo-banner">Demo workspace · Sample projects and conversations. Your real business records are not connected.</div>':''}${renderPage()}<footer class="bottom-note"><span>ILMIX © ${new Date().getFullYear()} · Production workspace</span><span>Production workspace v${escape(data.release)} · All times in PKT</span></footer></main></div>${renderChatDock()}`;
+  syncPanelHTML(app,markup);
   // The extra mobile-menu class is applied here to avoid duplicate class attributes.
   $('[data-action="mobile-toggle"]')?.classList.add('mobile-menu');
   updateLive();if(page==='messages'&&activeConversation)paintMessages();
@@ -544,16 +632,29 @@ function openMemberForm(id=''){
   const u=id?user(id):{name:'',username:'',role:'Employee',access:[],level:'Learning',joinDate:dayPKT(Date.now()),about:''};
   openModal('member-form',id?`Manage ${escape(u.name)}`:'Meet your next teammate.','Create accounts and choose what each person can access.',`<form data-form="member" data-id="${id}"><div class="form-grid">${field('Full name','name',u.name,'text','required maxlength="80"')}${field('Login ID','username',u.username,'text','required maxlength="80" pattern="[a-zA-Z0-9._@-]+"')}<label class="field">Role<select name="role">${['Employee','Partner'].map(r=>`<option ${r===u.role?'selected':''}>${r}</option>`).join('')}</select></label><label class="field">Experience level<select name="level">${['Learning','Beginner','Intermediate','Pro'].map(r=>`<option ${r===u.level?'selected':''}>${r}</option>`).join('')}</select></label>${field('Joining date','joinDate',u.joinDate,'date','required')}${id?'':field('Password','password','','password','required minlength="4" maxlength="128" autocomplete="new-password"')}<label class="field full">About<textarea name="about" rows="2" maxlength="500">${escape(u.about)}</textarea></label></div><h3 class="subsection-title">Permissions</h3><div class="check-list">${['view_all','assign_task','book_slot','review_work','view_clients','view_reports','send_push'].map(k=>`<label><input type="checkbox" name="access" value="${k}" ${u.access?.includes(k)?'checked':''}>${permissionLabel(k)}</label>`).join('')}</div><div class="form-hint" style="margin-top:15px">${icon('shield')}Everyone gets their own tasks, messages and personal report. CEO dashboard switching stays exclusive to the CEO.</div><div class="form-error" role="alert"></div><div class="form-actions">${id?btn('Reset password','reset-password','','data-id="'+id+'" type="button"'):''}${btn('Save member','submit','primary','type="submit"')}</div></form>${id?`<div class="divider"></div><p class="muted small">${u.active?'Reassign unfinished work before deactivating this account. Existing history is retained.':'This account is inactive. Reactivation restores the existing login.'}</p><div style="margin-top:12px">${btn(u.active?'Deactivate account':'Reactivate account','toggle-member',u.active?'danger':'',`data-id="${u.id}" data-active="${u.active}"`)}</div>`:''}`,true);
 }
+let drawerSignature='';
 function openWork(id){selectedWork=id;renderDrawer();}
-function closeDrawer(){selectedWork='';drawerRoot.innerHTML='';}
+function closeDrawer(){selectedWork='';drawerSignature='';drawerRoot.innerHTML='';}
 function renderDrawer(){
   const w=work(selectedWork);if(!w){closeDrawer();return;}
   const editable=has(w.kind==='slot'?'book_slot':'assign_task')&&w.status!=='Completed';
   const step={Pending:0,Started:1,'Revision Requested':1,'Revision Started':1,'Submitted For Review':2,Completed:3,Rejected:0}[w.status];
   const seconds=w.active_seconds+(w.timer_start?Math.max(0,(Date.now()-Date.parse(w.timer_start))/1000):0);
   const eventList=data.activity.filter(a=>a.work_id===w.id);
-  drawerRoot.innerHTML=`<div class="drawer-overlay" data-overlay="drawer"><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title"><header class="drawer-head"><div class="flex"><span class="muted small">IL-${String(w.seq).padStart(3,'0')} · ${w.kind==='slot'?'Client booking':'Internal task'}</span><div>${editable?icobtn('edit','Edit task','edit-work',`data-id="${w.id}"`):''}${icobtn('close','Close task','close-drawer')}</div></div><h2 id="drawer-title">${escape(w.title)}</h2><div class="action-row" style="margin-top:14px">${statusPill(w.status)}${priority(w)}</div></header><div class="drawer-body"><h3>The brief</h3><p class="description" style="margin-top:12px">${escape(w.info||'No additional instructions.')}</p><div class="detail-meta"><div><small>Assigned to</small><span class="person">${avatar(w.assignee,'tiny')}<strong>${escape(name(w.assignee))}</strong></span></div><div><small>Deadline · PKT</small><strong class="due ${overdue(w)?'overdue':''}">${dateTime(w.deadline)}</strong></div><div><small>Assigned by</small><strong>${escape(name(w.created_by))}</strong></div><div><small>Created</small><strong>${dateTime(w.created_at)}</strong></div>${w.kind==='slot'?`<div><small>Client / package</small><strong>${escape(w.client)} · ${escape(w.package)}</strong></div><div><small>Ad quantity</small><strong>${w.ads}</strong></div>`:''}</div><div class="workflow">${['Assigned','In progress','In review','Completed'].map((l,i)=>`<div class="workflow-step ${i<step?'done':i===step?'current':''}"><span></span>${l}</div>`).join('')}</div><div class="detail-actions">${w.transitions.map(s=>btn(icon(s==='Started'||s==='Revision Started'?'play':s==='Completed'?'completed':'arrow')+' '+({Started:'Start work','Revision Started':'Start revision','Submitted For Review':'Send for review',Completed:'Approve & complete','Revision Requested':'Request revision',Rejected:'Reject',Pending:'Restart task'}[s]),'status',s==='Rejected'?'danger':s==='Revision Requested'?'':'primary',`data-id="${w.id}" data-status="${s}"`)).join('')}</div>${w.status==='Submitted For Review'&&!w.transitions.length?'<p class="muted small">Waiting for review. You’ll receive a message when there’s an update.</p>':''}<div class="form-hint">${icon('clock')}${w.history_unknown?'Imported work · historical timing is incomplete.':`${(seconds/3600).toFixed(1)} active hours${w.timer_start?' · timer running':''} · Review waiting time excluded.`}</div><div class="detail-section"><div class="action-row" style="justify-content:space-between"><h3>Delivery links</h3>${w.status!=='Completed'&&(w.assignee===me().id||isCEO())?`<button class="text-btn" data-action="add-link" data-id="${w.id}">${icon('plus')} Add link</button>`:''}</div>${w.links.length?w.links.map(l=>`<a class="delivery-link" href="${escape(l.url)}" target="_blank" rel="noopener noreferrer">${icon('link')}${escape(l.name)}${icon('arrow')}</a>`).join(''):'<p class="muted small">Add a preview or final delivery link.</p>'}</div>${w.status==='Completed'?`<div class="detail-section"><div class="action-row" style="justify-content:space-between"><h3>Quality & feedback</h3>${has('review_work')&&(w.assignee!==me().id||isCEO())?`<button class="text-btn" data-action="rate" data-id="${w.id}">${w.rating?'Edit rating':'Add rating'}</button>`:''}</div>${w.rating?`<div class="rating-stars">${'★'.repeat(w.rating)}${'☆'.repeat(5-w.rating)}</div><p class="description">${escape(w.feedback||'No written feedback.')}</p>`:'<p class="muted small">No rating yet.</p>'}</div>`:''}<div class="detail-section"><h3>Revision history <span class="pill outline">${w.revisions.length}</span></h3>${w.revisions.length?w.revisions.map(r=>`<div class="revision-item"><strong>Revision ${r.number} · ${escape(r.by)}</strong><p>${escape(r.reason)}</p><small>${dateTime(r.at)}</small></div>`).join(''):'<p class="muted small">No revisions requested.</p>'}</div><div class="detail-section"><h3>Activity timeline</h3>${eventList.map(a=>`<div class="feed-entry">${avatar(a.actor_id,'tiny')}<div><p>${escape(a.action)}</p><small>${escape(a.actor)} · ${dateTime(a.at)}</small></div></div>`).join('')}</div>${isCEO()?`<div class="detail-section">${btn(icon('eye')+' Manage visibility','visibility','small',`data-id="${w.id}"`)}</div>`:''}</div></aside></div>`;
-  if(!modalType)$('[data-action="close-drawer"]',drawerRoot)?.focus({preventScroll:true});
+  const current=$('.drawer',drawerRoot),same=current?.dataset.workId===w.id;
+  const signature=JSON.stringify([w,eventList,data.members.map(u=>[u.id,u.name]),me().role,me().access]);
+  if(same&&signature===drawerSignature){const clock=$('[data-work-hours]',current);if(clock)clock.textContent=(seconds/3600).toFixed(1);return;}
+  const markup=`<div class="drawer-overlay" data-overlay="drawer"><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title"><header class="drawer-head"><div class="flex"><span class="muted small">IL-${String(w.seq).padStart(3,'0')} · ${w.kind==='slot'?'Client booking':'Internal task'}</span><div>${editable?icobtn('edit','Edit task','edit-work',`data-id="${w.id}"`):''}${icobtn('close','Close task','close-drawer')}</div></div><h2 id="drawer-title">${escape(w.title)}</h2><div class="action-row" style="margin-top:14px">${statusPill(w.status)}${priority(w)}</div></header><div class="drawer-body"><h3>The brief</h3><p class="description" style="margin-top:12px">${escape(w.info||'No additional instructions.')}</p><div class="detail-meta"><div><small>Assigned to</small><span class="person">${avatar(w.assignee,'tiny')}<strong>${escape(name(w.assignee))}</strong></span></div><div><small>Deadline · PKT</small><strong class="due ${overdue(w)?'overdue':''}">${dateTime(w.deadline)}</strong></div><div><small>Assigned by</small><strong>${escape(name(w.created_by))}</strong></div><div><small>Created</small><strong>${dateTime(w.created_at)}</strong></div>${w.kind==='slot'?`<div><small>Client / package</small><strong>${escape(w.client)} · ${escape(w.package)}</strong></div><div><small>Ad quantity</small><strong>${w.ads}</strong></div>`:''}</div><div class="workflow">${['Assigned','In progress','In review','Completed'].map((l,i)=>`<div class="workflow-step ${i<step?'done':i===step?'current':''}"><span></span>${l}</div>`).join('')}</div><div class="detail-actions">${w.transitions.map(s=>btn(icon(s==='Started'||s==='Revision Started'?'play':s==='Completed'?'completed':'arrow')+' '+({Started:'Start work','Revision Started':'Start revision','Submitted For Review':'Send for review',Completed:'Approve & complete','Revision Requested':'Request revision',Rejected:'Reject',Pending:'Restart task'}[s]),'status',s==='Rejected'?'danger':s==='Revision Requested'?'':'primary',`data-id="${w.id}" data-status="${s}"`)).join('')}${canRateWork(w)?btn(icon('star')+' '+(w.rating?'Edit rating':'Rate '+(w.kind==='slot'?'ad':'task')),'rate','primary',`data-id="${w.id}"`):''}</div>${w.status==='Submitted For Review'&&!w.transitions.length?'<p class="muted small">Waiting for review. You’ll receive a message when there’s an update.</p>':''}<div class="form-hint">${icon('clock')}${w.history_unknown?'Imported work · historical timing is incomplete.':`<span data-work-hours>${(seconds/3600).toFixed(1)}</span> active hours${w.timer_start?' · timer running':''} · Review waiting time excluded.`}</div><div class="detail-section"><div class="action-row" style="justify-content:space-between"><h3>Delivery links</h3>${w.status!=='Completed'&&(w.assignee===me().id||isCEO())?`<button class="text-btn" data-action="add-link" data-id="${w.id}">${icon('plus')} Add link</button>`:''}</div>${w.links.length?w.links.map(l=>`<a class="delivery-link" href="${escape(l.url)}" target="_blank" rel="noopener noreferrer">${icon('link')}${escape(l.name)}${icon('arrow')}</a>`).join(''):'<p class="muted small">Add a preview or final delivery link.</p>'}</div>${w.status==='Completed'?`<div class="detail-section"><div class="action-row" style="justify-content:space-between"><h3>Quality & feedback</h3>${has('review_work')&&(w.assignee!==me().id||isCEO())?`<button class="text-btn" data-action="rate" data-id="${w.id}">${w.rating?'Edit rating':'Add rating'}</button>`:''}</div>${w.rating?`<div class="rating-stars">${'★'.repeat(w.rating)}${'☆'.repeat(5-w.rating)}</div><p class="description">${escape(w.feedback||'No written feedback.')}</p>`:'<p class="muted small">No rating yet.</p>'}</div>`:''}<div class="detail-section"><h3>Revision history <span class="pill outline">${w.revisions.length}</span></h3>${w.revisions.length?w.revisions.map(r=>`<div class="revision-item"><strong>Revision ${r.number} · ${escape(r.by)}</strong><p>${escape(r.reason)}</p><small>${dateTime(r.at)}</small></div>`).join(''):'<p class="muted small">No revisions requested.</p>'}</div><div class="detail-section"><h3>Activity timeline</h3>${eventList.map(a=>`<div class="feed-entry">${avatar(a.actor_id,'tiny')}<div><p>${escape(a.action)}</p><small>${escape(a.actor)} · ${dateTime(a.at)}</small></div></div>`).join('')}</div>${isCEO()?`<div class="detail-section">${btn(icon('eye')+' Manage visibility','visibility','small',`data-id="${w.id}"`)}</div>`:''}</div></aside></div>`;
+  if(same){
+    const template=document.createElement('template');template.innerHTML=markup;
+    const fresh=$('.drawer',template.content),focused=document.activeElement;
+    const focusKey=current.contains(focused)?{action:focused.dataset.action,id:focused.dataset.id,status:focused.dataset.status}:null;
+    const body=$('.drawer-body',current),bodyScroll=body.scrollTop,outerScroll=current.scrollTop;
+    for(const selector of ['.drawer-head','.drawer-body']){const target=$(selector,current),next=$(selector,fresh);syncPanelNode(target,next);}
+    body.scrollTop=bodyScroll;current.scrollTop=outerScroll;
+    if(focusKey&&focusKey.action&&!focused.isConnected){const replacement=[...current.querySelectorAll('[data-action]')].find(el=>el.dataset.action===focusKey.action&&el.dataset.id===focusKey.id&&el.dataset.status===focusKey.status);replacement?.focus({preventScroll:true});}
+  }else{drawerRoot.innerHTML=markup;$('.drawer',drawerRoot).dataset.workId=w.id;if(!modalType)$('[data-action="close-drawer"]',drawerRoot)?.focus({preventScroll:true});}
+  drawerSignature=signature;
 }
 function openStatusNote(w,status){openModal('status-note',status,status==='Revision Requested'?'Clear feedback makes the next version better.':'Explain what needs to happen next.',`<form data-form="status" data-id="${w.id}" data-version="${w.version}" data-status="${status}"><label class="field">${status==='Revision Requested'?'What should change?':'Reason'}<textarea name="note" required maxlength="4000" rows="5"></textarea></label><div class="form-error" role="alert"></div><div class="form-actions">${btn('Send feedback','submit','primary','type="submit"')}</div></form>`);}
 function renderNotifications(){
@@ -565,7 +666,7 @@ function chatDockContent(){
  return `${chatDockOpen?`<section class="quick-chat" id="quick-chat" aria-label="Team conversations"><header><span class="chat-heading-icon">${icon('message')}</span><div><h2>Your team, closer.</h2><p>${unread?`${unread} unread ${unread===1?'message':'messages'}`:'You’re all caught up.'}</p></div>${icobtn('close','Close team chat','chat-dock-close')}</header><div class="chat-dock-label"><span>RECENT CONVERSATIONS</span><button class="text-btn" data-action="chat-dock-new">${icon('plus')}New</button></div><div class="quick-chat-list">${conversations.length?conversations.map(c=>`<button class="quick-conversation ${c.unread?'has-unread':''}" data-action="open-chat" data-id="${c.id}">${conversationAvatar(c)}<span class="quick-chat-copy"><strong>${escape(conversationTitle(c))}</strong><span class="quick-person-presence">${conversationPresence(c)}</span><small>${escape(c.last?.body||'Start the conversation.')}</small></span><span class="quick-chat-meta">${c.last?`<time>${dayPKT(c.last.created_at)===dayPKT(Date.now())?time(c.last.created_at):date(c.last.created_at)}</time>`:''}${c.unread?`<b>${c.unread>99?'99+':c.unread}</b>`:icon('chevron')}</span></button>`).join(''):`<div class="quick-chat-empty"><span>${icon('message')}</span><strong>Good work starts with a conversation.</strong><p>Share a brief, ask a question, or say hello.</p></div>`}</div><footer><span>${icon('shield')}Just your team</span><button class="btn small primary" data-nav="messages">Open messages ${icon('arrow')}</button></footer></section>`:''}<button class="chat-launcher" data-action="chat-dock-toggle" aria-label="${chatDockOpen?'Close':'Open'} team chat${unread?', '+unread+' unread messages':''}" aria-expanded="${chatDockOpen}" ${chatDockOpen?'aria-controls="quick-chat"':''}>${icon(chatDockOpen?'close':'message')}${unread?`<span class="chat-unread">${unread>99?'99+':unread}</span>`:''}</button>`;
 }
 function renderChatDock(){return page==='messages'?'':`<div id="chat-dock">${chatDockContent()}</div>`;}
-function syncChatDock(){const dock=$('#chat-dock');if(dock)dock.innerHTML=chatDockContent();}
+function syncChatDock(){syncPanelHTML($('#chat-dock'),chatDockContent());}
 function closeChatDock(focus=false){chatDockOpen=false;syncChatDock();if(focus)$('[data-action="chat-dock-toggle"]')?.focus();}
 
 function conversationTitle(c){if(c.kind==='group')return c.title;const other=c.participants.find(p=>p.user_id!==me().id);return other?name(other.user_id):'Notes to yourself';}
@@ -588,7 +689,7 @@ async function loadMessages(older=false,quiet=false){
     const latest=threadMessages.at(-1)?.id||0,read=chatParticipants.find(p=>p.user_id===me().id)?.last_read_id||0;
     if(!older&&!chatQuery&&latest>read&&(!quiet||atBottom)&&document.visibilityState==='visible'){
       await api('/api/action',{action:'read_thread',conversationId:id,through:latest});
-      const c=data.conversations.find(c=>c.id===id);if(c){c.unread=0;c.last_read_id=latest;}updateCounts();if($('#conversation-list'))$('#conversation-list').innerHTML=conversationsHTML();
+      const c=data.conversations.find(c=>c.id===id);if(c){c.unread=0;c.last_read_id=latest;}updateCounts();syncPanelHTML($('#conversation-list'),conversationsHTML());
     }
   }catch(e){if(!quiet)toast(e.message,true);}
 }
@@ -646,7 +747,7 @@ document.addEventListener('click',async e=>{
     case'mobile-close':mobile=false;render();break;
     case'theme':{const dark=document.documentElement.dataset.theme!=='dark';document.documentElement.dataset.theme=dark?'dark':'light';try{localStorage.setItem('ilmix-white-theme',dark?'dark':'light');}catch{}break;}
     case'show-password':{const input=el.closest('.password-wrap').querySelector('input');input.type=input.type==='password'?'text':'password';el.setAttribute('aria-label',input.type==='password'?'Show password':'Hide password');break;}
-    case'logout':await api('/api/logout',{});stopLive();data=null;closeModal(true);closeDrawer();await refresh(true);break;
+    case'logout':void publishPresence(true,'offline');await api('/api/logout',{});stopLive();data=null;closeModal(true);closeDrawer();await refresh(true);break;
     case'whats-new':showWelcome();break;
     case'welcome-dismiss':await dismissWelcome();break;
     case'close-modal':closeModal();break;
@@ -654,9 +755,9 @@ document.addEventListener('click',async e=>{
     case'new-task':openTaskForm('task');break;
     case'new-slot':openTaskForm('slot');break;
     case'edit-work':openTaskForm(work(id).kind,id);break;
-    case'status':{const w=work(id),s=el.dataset.status;if(['Revision Requested','Rejected'].includes(s))openStatusNote(w,s);else{el.disabled=true;await action({action:'status',id:w.id,version:w.version,status:s},s==='Completed'?'Work approved and completed.':`Status updated: ${s}`);renderDrawer();}break;}
+    case'status':{const w=work(id),s=el.dataset.status;if(['Revision Requested','Rejected'].includes(s))openStatusNote(w,s);else{el.disabled=true;await action({action:'status',id:w.id,version:w.version,status:s},s==='Completed'?'Work approved and completed.':`Status updated: ${s}`);renderDrawer();if(s==='Completed'&&selectedWork===w.id)openRating(work(w.id),true);}break;}
     case'add-link':{const w=work(id);openModal('link','Share your work.','Add a review preview or final delivery link.',`<form data-form="link" data-id="${id}" data-version="${w.version}">${field('Link label','name','','text','required maxlength="120" placeholder="e.g. First cut · Review"')}<div style="margin-top:15px">${field('Web address','url','','url','required maxlength="2048" placeholder="https://"')}</div><div class="form-error" role="alert"></div><div class="form-actions">${btn('Add delivery link','submit','primary','type="submit"')}</div></form>`);break;}
-    case'rate':{const w=work(id);openModal('rating','A little feedback goes a long way.','Rate this completed task and share useful feedback.',`<form data-form="rating" data-id="${id}" data-version="${w.version}"><label class="field">Quality rating<select name="rating" required>${[5,4,3,2,1].map(n=>`<option value="${n}" ${(w.rating||5)===n?'selected':''}>${'★'.repeat(n)} · ${n} / 5</option>`).join('')}</select></label><label class="field" style="margin-top:18px">Feedback<textarea name="feedback" rows="4" maxlength="2000">${escape(w.feedback)}</textarea></label><div class="form-error" role="alert"></div><div class="form-actions">${btn('Save feedback','submit','primary','type="submit"')}</div></form>`);break;}
+    case'rate':openRating(work(id));break;
     case'visibility':{const w=work(id);openModal('visibility','Task visibility','The CEO and assigned person always retain access.',`<form data-form="visibility" data-id="${id}" data-version="${w.version}"><div class="check-list">${data.members.filter(u=>u.role!=='CEO').map(u=>`<label><input type="checkbox" name="hiddenFrom" value="${u.id}" ${w.hidden_from.includes(u.id)?'checked':''} ${u.id===w.assignee?'disabled':''}>Hide from ${escape(u.name)} ${u.id===w.assignee?'(assignee)':''}</label>`).join('')}</div><div class="form-error" role="alert"></div><div class="form-actions">${btn('Save visibility','submit','primary','type="submit"')}</div></form>`);break;}
     case'add-member':openMemberForm();break;
     case'urgent-reminder':openModal('reminder',`Remind ${escape(name(id))}`,'Send an urgent reminder to their messages and notifications.',`<form data-form="reminder" data-id="${id}"><label class="field">Your reminder<textarea name="message" required rows="4" maxlength="2000" placeholder="What needs their attention?"></textarea></label><div class="form-error" role="alert"></div><div class="form-actions">${btn('Send reminder','submit','primary','type="submit"')}</div></form>`);break;
@@ -741,7 +842,7 @@ document.addEventListener('submit',async e=>{
 document.addEventListener('input',e=>{
   const el=e.target;
   if(el.id==='task-search'){taskSearch=el.value;$('#tasks-result').innerHTML=renderTaskResults();}
-  if(el.id==='conversation-search'){chatSearch=el.value;$('#conversation-list').innerHTML=conversationsHTML();}
+  if(el.id==='conversation-search'){chatSearch=el.value;syncPanelHTML($('#conversation-list'),conversationsHTML());}
   if(el.id==='message-input'){
     drafts[activeConversation]=el.value;
     // A changed draft gets a new retry identifier, while an unchanged retry stays idempotent.
@@ -778,7 +879,9 @@ document.addEventListener('keydown',e=>{
 });
 window.addEventListener('offline',()=>setBackendStatus('offline','Your internet connection is offline. Reconnect, then retry.'));
 window.addEventListener('online',()=>{setBackendStatus('checking');refresh(true);});
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&me())refresh();syncPresenceUI();});
+document.addEventListener('visibilitychange',()=>{void publishPresence(true);if(document.visibilityState==='visible'&&me())refresh();syncPresenceUI();});
+window.addEventListener('pagehide',()=>{void publishPresence(true,'offline');});
+window.addEventListener('pageshow',()=>{if(me()){void publishPresence(true);refresh();}});
 setInterval(syncPresenceUI,5000);
 try{document.documentElement.dataset.theme=localStorage.getItem('ilmix-white-theme')||'light';}catch{}
 refresh(true);
